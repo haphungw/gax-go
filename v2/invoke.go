@@ -37,6 +37,8 @@ import (
 
 	"github.com/googleapis/gax-go/v2/apierror"
 	"github.com/googleapis/gax-go/v2/callctx"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // APICall is a user defined call stub.
@@ -100,6 +102,29 @@ func invoke(ctx context.Context, call APICall, settings CallSettings, sp sleeper
 	retryCount := 0
 	// Feature gate: GOOGLE_SDK_GO_EXPERIMENTAL_TRACING=true
 	tracingEnabled := IsFeatureEnabled("TRACING")
+
+	if tracingEnabled && settings.clientTracing != nil && settings.clientTracing.tracer() != nil {
+		spanName := "gax.Invoke"
+		if rpcMethod, ok := callctx.TelemetryFromContext(ctx, "rpc_method"); ok && rpcMethod != "" {
+			spanName = rpcMethod
+		}
+		var span trace.Span
+		ctx, span = settings.clientTracing.tracer().Start(
+			ctx,
+			spanName,
+			trace.WithAttributes(settings.clientTracing.attributes()...),
+		)
+		if urlTemplate, ok := callctx.TelemetryFromContext(ctx, "url_template"); ok && urlTemplate != "" {
+			span.SetAttributes(attribute.String("url.template", urlSanitizer(urlTemplate)))
+		}
+		defer func() {
+			if err != nil {
+				span.RecordError(err)
+			}
+			span.End()
+		}()
+	}
+
 	for {
 		ctxToUse := ctx
 		if tracingEnabled {
@@ -138,4 +163,11 @@ func invoke(ctx context.Context, call APICall, settings CallSettings, sp sleeper
 		}
 		retryCount++
 	}
+}
+
+func urlSanitizer(rawURL string) string {
+	if idx := strings.IndexAny(rawURL, "?#"); idx != -1 {
+		return rawURL[:idx]
+	}
+	return rawURL
 }

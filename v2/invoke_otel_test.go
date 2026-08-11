@@ -39,6 +39,8 @@ import (
 	"github.com/googleapis/gax-go/v2/callctx"
 	"go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -236,6 +238,82 @@ func TestInvokeWithMetrics(t *testing.T) {
 
 			if diff := cmp.Diff(tt.wantDataAttr, gotDataAttr); diff != "" {
 				t.Errorf("DataPoint attributes mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+func TestInvokeWithTracing(t *testing.T) {
+	t.Setenv("GOOGLE_SDK_GO_EXPERIMENTAL_TRACING", "true")
+	TestOnlyResetIsFeatureEnabled()
+	defer TestOnlyResetIsFeatureEnabled()
+
+	exporter := tracetest.NewInMemoryExporter()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+
+	ctx := context.Background()
+	ctx = callctx.WithTelemetryContext(ctx, "rpc_method", "my.test.Method", "url_template", "/v1/test?query=123")
+
+	opts := []TracingOption{
+		WithTracerProvider(provider),
+		WithTracingAttributes(map[string]string{
+			URLDomain: "test.domain",
+			RPCSystem: "grpc",
+		}),
+	}
+	ct := NewClientTracing(opts...)
+	callOpts := []CallOption{WithClientTracing(ct)}
+
+	callFunc := func(ctx context.Context, settings CallSettings) error {
+		return nil
+	}
+
+	err := Invoke(ctx, callFunc, callOpts...)
+	if err != nil {
+		t.Fatalf("Invoke() error = %v", err)
+	}
+
+	spans := exporter.GetSpans()
+	if len(spans) != 1 {
+		t.Fatalf("expected 1 span, got %d", len(spans))
+	}
+	span := spans[0]
+	if span.Name != "my.test.Method" {
+		t.Errorf("expected span name 'my.test.Method', got %q", span.Name)
+	}
+
+	var foundDomain, foundSystem, foundUrlTemplate bool
+	for _, attr := range span.Attributes {
+		if string(attr.Key) == "url.domain" && attr.Value.AsString() == "test.domain" {
+			foundDomain = true
+		}
+		if string(attr.Key) == "rpc.system.name" && attr.Value.AsString() == "grpc" {
+			foundSystem = true
+		}
+		if string(attr.Key) == "url.template" && attr.Value.AsString() == "/v1/test" {
+			foundUrlTemplate = true
+		}
+	}
+	if !foundDomain || !foundSystem || !foundUrlTemplate {
+		t.Errorf("missing expected attributes: domain=%v system=%v url.template=%v", foundDomain, foundSystem, foundUrlTemplate)
+	}
+}
+
+func TestUrlSanitizer(t *testing.T) {
+	tests := []struct {
+		rawURL string
+		want   string
+	}{
+		{"/v1/test", "/v1/test"},
+		{"/v1/test?query=123", "/v1/test"},
+		{"/v1/test#frag", "/v1/test"},
+		{"/v1/test/{id}?query=123", "/v1/test/{id}"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.rawURL, func(t *testing.T) {
+			got := urlSanitizer(tt.rawURL)
+			if got != tt.want {
+				t.Errorf("urlSanitizer(%q) = %q, want %q", tt.rawURL, got, tt.want)
 			}
 		})
 	}

@@ -43,6 +43,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -189,8 +190,17 @@ func (a attrOpt) Resolve(opts *telemetryOptions) {
 	opts.attributes = a.attrs
 }
 
+func (a attrOpt) ResolveTracing(opts *tracingOptions) {
+	opts.attributes = a.attrs
+}
+
 // WithTelemetryAttributes specifies the static attributes attachments.
 func WithTelemetryAttributes(attr map[string]string) TelemetryOption {
+	return &attrOpt{attrs: attr}
+}
+
+// WithTracingAttributes specifies the static attributes attachments for tracing.
+func WithTracingAttributes(attr map[string]string) TracingOption {
 	return &attrOpt{attrs: attr}
 }
 
@@ -480,4 +490,97 @@ func recordMetric(ctx context.Context, settings CallSettings, d time.Duration, e
 	}
 
 	settings.clientMetrics.durationHistogram().Record(recordCtx, d.Seconds(), metric.WithAttributes(attrs...))
+}
+
+// ClientTracing contains the pre-allocated OpenTelemetry tracer and attributes.
+type ClientTracing struct {
+	get func() clientTracingData
+}
+
+type clientTracingData struct {
+	tracer trace.Tracer
+	attr   []attribute.KeyValue
+}
+
+type tracingOptions struct {
+	provider   trace.TracerProvider
+	attributes map[string]string
+}
+
+// TracingOption is an option to configure a ClientTracing instance.
+type TracingOption interface {
+	// ResolveTracing applies the option by modifying opts.
+	ResolveTracing(opts *tracingOptions)
+}
+
+type tracerProviderOpt struct {
+	p trace.TracerProvider
+}
+
+func (p tracerProviderOpt) ResolveTracing(opts *tracingOptions) {
+	opts.provider = p.p
+}
+
+// WithTracerProvider specifies the trace.TracerProvider to use for instruments.
+func WithTracerProvider(p trace.TracerProvider) TracingOption {
+	return &tracerProviderOpt{p: p}
+}
+
+func (config *tracingOptions) tracerProvider() trace.TracerProvider {
+	if config.provider != nil {
+		return config.provider
+	}
+	return otel.GetTracerProvider()
+}
+
+// NewClientTracing initializes and returns a new ClientTracing instance.
+func NewClientTracing(opts ...TracingOption) *ClientTracing {
+	var config tracingOptions
+	for _, opt := range opts {
+		opt.ResolveTracing(&config)
+	}
+
+	return &ClientTracing{
+		get: sync.OnceValue(func() clientTracingData {
+			provider := config.tracerProvider()
+
+			var tracerOpts []trace.TracerOption
+			if val, ok := config.attributes[ClientVersion]; ok {
+				tracerOpts = append(tracerOpts, trace.WithInstrumentationVersion(val))
+			}
+			tracerOpts = append(tracerOpts, trace.WithSchemaURL(schemaURL))
+
+			tracer := provider.Tracer(config.attributes[ClientArtifact], tracerOpts...)
+
+			var attr []attribute.KeyValue
+			if val, ok := config.attributes[URLDomain]; ok {
+				attr = append(attr, attribute.KeyValue{Key: attribute.Key(keyURLDomain), Value: attribute.StringValue(val)})
+			}
+			if val, ok := config.attributes[RPCSystem]; ok {
+				attr = append(attr, attribute.KeyValue{Key: attribute.Key(keyRPCSystemName), Value: attribute.StringValue(val)})
+			}
+			if val, ok := config.attributes[ClientService]; ok {
+				attr = append(attr, attribute.KeyValue{Key: attribute.Key(keyGCPClientService), Value: attribute.StringValue(val)})
+			}
+
+			return clientTracingData{
+				tracer: tracer,
+				attr:   attr,
+			}
+		}),
+	}
+}
+
+func (ct *ClientTracing) tracer() trace.Tracer {
+	if ct == nil || ct.get == nil {
+		return nil
+	}
+	return ct.get().tracer
+}
+
+func (ct *ClientTracing) attributes() []attribute.KeyValue {
+	if ct == nil || ct.get == nil {
+		return nil
+	}
+	return ct.get().attr
 }
