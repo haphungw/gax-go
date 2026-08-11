@@ -31,6 +31,9 @@ package gax
 
 import (
 	"context"
+	"errors"
+	"log/slog"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -38,6 +41,7 @@ import (
 	"github.com/googleapis/gax-go/v2/apierror"
 	"github.com/googleapis/gax-go/v2/callctx"
 	"go.opentelemetry.io/otel/attribute"
+	otelcodes "go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -103,12 +107,17 @@ func invoke(ctx context.Context, call APICall, settings CallSettings, sp sleeper
 	// Feature gate: GOOGLE_SDK_GO_EXPERIMENTAL_TRACING=true
 	tracingEnabled := IsFeatureEnabled("TRACING")
 
+	var span trace.Span
+	var logger *slog.Logger
+	if settings.clientLogging != nil {
+		logger = settings.clientLogging.logger()
+	}
+
 	if tracingEnabled && settings.clientTracing != nil && settings.clientTracing.tracer() != nil {
 		spanName := "gax.Invoke"
 		if rpcMethod, ok := callctx.TelemetryFromContext(ctx, "rpc_method"); ok && rpcMethod != "" {
 			spanName = rpcMethod
 		}
-		var span trace.Span
 		ctx, span = settings.clientTracing.tracer().Start(
 			ctx,
 			spanName,
@@ -117,11 +126,68 @@ func invoke(ctx context.Context, call APICall, settings CallSettings, sp sleeper
 		if urlTemplate, ok := callctx.TelemetryFromContext(ctx, "url_template"); ok && urlTemplate != "" {
 			span.SetAttributes(attribute.String("url.template", urlSanitizer(urlTemplate)))
 		}
+	}
+
+	if span != nil || logger != nil {
 		defer func() {
-			if err != nil {
-				span.RecordError(err)
+			if span != nil {
+				if err != nil {
+					span.RecordError(err)
+					span.SetStatus(otelcodes.Error, err.Error())
+				}
+				span.End()
 			}
-			span.End()
+			if logger != nil {
+				recordCtx := context.WithoutCancel(ctx)
+				errInfo := ExtractTelemetryErrorInfo(ctx, err)
+
+				msg := "OK"
+				level := slog.LevelDebug
+
+				if err != nil {
+					level = slog.LevelError
+					msg = errInfo.StatusMessage
+					// Strip the URL context from net/url.Error natively
+					var uErr *url.Error
+					if errors.As(err, &uErr) {
+						msg = uErr.Err.Error()
+					}
+				}
+
+				attrs := make([]attribute.KeyValue, 0, len(settings.clientLogging.attributes())+5)
+				attrs = append(attrs, settings.clientLogging.attributes()...)
+
+				if err != nil {
+					if errInfo.ErrorType != "" {
+						attrs = append(attrs, attribute.String("error.type", errInfo.ErrorType))
+					}
+					attrs = append(attrs, attribute.String("rpc.response.status_code", errInfo.StatusCode))
+				}
+
+				if rpcMethod, ok := callctx.TelemetryFromContext(ctx, "rpc_method"); ok && rpcMethod != "" {
+					attrs = append(attrs, attribute.String("rpc.method", rpcMethod))
+				}
+				if urlTemplate, ok := callctx.TelemetryFromContext(ctx, "url_template"); ok && urlTemplate != "" {
+					attrs = append(attrs, attribute.String("url.template", urlSanitizer(urlTemplate)))
+				}
+
+				opts := make([]slog.Attr, 0, len(attrs))
+				for _, kv := range attrs {
+					opts = append(opts, otelAttrToSlogAttr(kv))
+				}
+
+				if err != nil {
+					if errInfo.Domain != "" {
+						opts = append(opts, slog.String("error.domain", errInfo.Domain))
+					}
+					for k, v := range errInfo.Metadata {
+						opts = append(opts, slog.String("error.metadata."+k, v))
+					}
+				}
+
+				// The prompt says: "Map errInfo correctly, translating OTel attributes back to slog.Attr via the otelAttrToSlogAttr translator (which you can use on the attrs slice)."
+				logger.LogAttrs(recordCtx, level, msg, opts...)
+			}
 		}()
 	}
 
@@ -170,4 +236,27 @@ func urlSanitizer(rawURL string) string {
 		return rawURL[:idx]
 	}
 	return rawURL
+}
+
+func otelAttrToSlogAttr(kv attribute.KeyValue) slog.Attr {
+	switch kv.Value.Type() {
+	case attribute.BOOL:
+		return slog.Bool(string(kv.Key), kv.Value.AsBool())
+	case attribute.INT64:
+		return slog.Int64(string(kv.Key), kv.Value.AsInt64())
+	case attribute.FLOAT64:
+		return slog.Float64(string(kv.Key), kv.Value.AsFloat64())
+	case attribute.STRING:
+		return slog.String(string(kv.Key), kv.Value.AsString())
+	case attribute.BOOLSLICE:
+		return slog.Any(string(kv.Key), kv.Value.AsBoolSlice())
+	case attribute.INT64SLICE:
+		return slog.Any(string(kv.Key), kv.Value.AsInt64Slice())
+	case attribute.FLOAT64SLICE:
+		return slog.Any(string(kv.Key), kv.Value.AsFloat64Slice())
+	case attribute.STRINGSLICE:
+		return slog.Any(string(kv.Key), kv.Value.AsStringSlice())
+	default:
+		return slog.Any(string(kv.Key), kv.Value.AsInterface())
+	}
 }

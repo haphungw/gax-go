@@ -194,6 +194,10 @@ func (a attrOpt) ResolveTracing(opts *tracingOptions) {
 	opts.attributes = a.attrs
 }
 
+func (a attrOpt) ResolveLogging(opts *loggingOptions) {
+	opts.attributes = a.attrs
+}
+
 // WithTelemetryAttributes specifies the static attributes attachments.
 func WithTelemetryAttributes(attr map[string]string) TelemetryOption {
 	return &attrOpt{attrs: attr}
@@ -201,6 +205,11 @@ func WithTelemetryAttributes(attr map[string]string) TelemetryOption {
 
 // WithTracingAttributes specifies the static attributes attachments for tracing.
 func WithTracingAttributes(attr map[string]string) TracingOption {
+	return &attrOpt{attrs: attr}
+}
+
+// WithLoggingAttributes specifies the static attributes attachments for logging.
+func WithLoggingAttributes(attr map[string]string) LoggingOption {
 	return &attrOpt{attrs: attr}
 }
 
@@ -492,7 +501,7 @@ func recordMetric(ctx context.Context, settings CallSettings, d time.Duration, e
 	settings.clientMetrics.durationHistogram().Record(recordCtx, d.Seconds(), metric.WithAttributes(attrs...))
 }
 
-// ClientTracing contains the pre-allocated OpenTelemetry tracer and attributes.
+// ClientTracing contains the pre-allocated OpenTelemetry tracer and attributes
 type ClientTracing struct {
 	get func() clientTracingData
 }
@@ -509,7 +518,6 @@ type tracingOptions struct {
 
 // TracingOption is an option to configure a ClientTracing instance.
 type TracingOption interface {
-	// ResolveTracing applies the option by modifying opts.
 	ResolveTracing(opts *tracingOptions)
 }
 
@@ -583,4 +591,92 @@ func (ct *ClientTracing) attributes() []attribute.KeyValue {
 		return nil
 	}
 	return ct.get().attr
+}
+
+// ClientLogging contains the pre-allocated OpenTelemetry logger and attributes.
+type ClientLogging struct {
+	get func() clientLoggingData
+}
+
+type clientLoggingData struct {
+	logger *slog.Logger
+	attr   []attribute.KeyValue
+}
+
+type loggingOptions struct {
+	provider   *slog.Logger
+	attributes map[string]string
+}
+
+// LoggingOption is an option to configure a ClientLogging instance.
+type LoggingOption interface {
+	// ResolveLogging applies the option by modifying opts.
+	ResolveLogging(opts *loggingOptions)
+}
+
+type loggerProviderOpt struct {
+	p *slog.Logger
+}
+
+func (p loggerProviderOpt) ResolveLogging(opts *loggingOptions) {
+	opts.provider = p.p
+}
+
+// WithLoggerProvider specifies the logger to use.
+func WithLoggerProvider(p *slog.Logger) LoggingOption {
+	return &loggerProviderOpt{p: p}
+}
+
+func (config *loggingOptions) loggerProvider() *slog.Logger {
+	if config.provider != nil {
+		return config.provider
+	}
+	return slog.Default()
+}
+
+// NewClientLogging initializes and returns a new ClientLogging instance.
+func NewClientLogging(opts ...LoggingOption) *ClientLogging {
+	var config loggingOptions
+	for _, opt := range opts {
+		opt.ResolveLogging(&config)
+	}
+
+	return &ClientLogging{
+		get: sync.OnceValue(func() clientLoggingData {
+			logger := config.loggerProvider()
+
+			var attr []attribute.KeyValue
+			if val, ok := config.attributes[URLDomain]; ok {
+				attr = append(attr, attribute.KeyValue{Key: attribute.Key(keyURLDomain), Value: attribute.StringValue(val)})
+			}
+			if val, ok := config.attributes[RPCSystem]; ok {
+				attr = append(attr, attribute.KeyValue{Key: attribute.Key(keyRPCSystemName), Value: attribute.StringValue(val)})
+			}
+			if val, ok := config.attributes[ClientService]; ok {
+				attr = append(attr, attribute.KeyValue{Key: attribute.Key(keyGCPClientService), Value: attribute.StringValue(val)})
+			}
+			if val, ok := config.attributes[ClientVersion]; ok {
+				attr = append(attr, attribute.KeyValue{Key: attribute.Key(ClientVersion), Value: attribute.StringValue(val)})
+			}
+
+			return clientLoggingData{
+				logger: logger,
+				attr:   attr,
+			}
+		}),
+	}
+}
+
+func (cl *ClientLogging) logger() *slog.Logger {
+	if cl == nil || cl.get == nil {
+		return nil
+	}
+	return cl.get().logger
+}
+
+func (cl *ClientLogging) attributes() []attribute.KeyValue {
+	if cl == nil || cl.get == nil {
+		return nil
+	}
+	return cl.get().attr
 }
