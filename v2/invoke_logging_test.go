@@ -10,6 +10,8 @@ import (
 
 	"github.com/googleapis/gax-go/v2/callctx"
 	"go.opentelemetry.io/otel/attribute"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
 type mockHandler struct {
@@ -125,5 +127,138 @@ func TestOtelAttrToSlogAttr(t *testing.T) {
 				t.Errorf("Value mismatch: got %v, want %v", got.Value.Any(), tt.want.Value.Any())
 			}
 		})
+	}
+}
+
+func TestInvokeWithTracingAndLogging(t *testing.T) {
+	t.Setenv("GOOGLE_SDK_GO_EXPERIMENTAL_TRACING", "true")
+	TestOnlyResetIsFeatureEnabled()
+	defer TestOnlyResetIsFeatureEnabled()
+
+	exporter := tracetest.NewInMemoryExporter()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+
+	handler := &mockHandler{}
+	logger := slog.New(handler)
+
+	ctx := context.Background()
+
+	optsTracing := []TracingOption{
+		WithTracerProvider(provider),
+	}
+	ct := NewClientTracing(optsTracing...)
+
+	optsLogging := []LoggingOption{
+		WithLoggerProvider(logger),
+	}
+	cl := NewClientLogging(optsLogging...)
+
+	callOpts := []CallOption{
+		WithClientTracing(ct),
+		WithClientLogging(cl),
+	}
+
+	callFunc := func(ctx context.Context, settings CallSettings) error {
+		return nil
+	}
+
+	err := Invoke(ctx, callFunc, callOpts...)
+	if err != nil {
+		t.Fatalf("Invoke() error = %v", err)
+	}
+
+	spans := exporter.GetSpans()
+	if len(spans) != 1 {
+		t.Fatalf("expected 1 span, got %d", len(spans))
+	}
+	span := spans[0]
+
+	if len(handler.records) != 1 {
+		t.Fatalf("expected 1 log record, got %d", len(handler.records))
+	}
+	record := handler.records[0]
+
+	var traceID, spanID string
+	record.Attrs(func(attr slog.Attr) bool {
+		if attr.Key == "trace_id" {
+			traceID = attr.Value.String()
+		}
+		if attr.Key == "span_id" {
+			spanID = attr.Value.String()
+		}
+		return true
+	})
+
+	if traceID == "" || spanID == "" {
+		t.Errorf("missing TraceID or SpanID in logs. traceID=%q, spanID=%q", traceID, spanID)
+	}
+	
+	if traceID != span.SpanContext.TraceID().String() {
+		t.Errorf("TraceID mismatch. Log=%q, Span=%q", traceID, span.SpanContext.TraceID().String())
+	}
+	
+	if spanID != span.SpanContext.SpanID().String() {
+		t.Errorf("SpanID mismatch. Log=%q, Span=%q", spanID, span.SpanContext.SpanID().String())
+	}
+}
+
+func TestInvokePanicWithTracingAndLogging(t *testing.T) {
+	t.Setenv("GOOGLE_SDK_GO_EXPERIMENTAL_TRACING", "true")
+	TestOnlyResetIsFeatureEnabled()
+	defer TestOnlyResetIsFeatureEnabled()
+
+	exporter := tracetest.NewInMemoryExporter()
+	provider := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+
+	handler := &mockHandler{}
+	logger := slog.New(handler)
+
+	ctx := context.Background()
+
+	optsTracing := []TracingOption{
+		WithTracerProvider(provider),
+	}
+	ct := NewClientTracing(optsTracing...)
+
+	optsLogging := []LoggingOption{
+		WithLoggerProvider(logger),
+	}
+	cl := NewClientLogging(optsLogging...)
+
+	callOpts := []CallOption{
+		WithClientTracing(ct),
+		WithClientLogging(cl),
+	}
+
+	callFunc := func(ctx context.Context, settings CallSettings) error {
+		panic("test panic")
+	}
+
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatalf("expected panic")
+			}
+		}()
+		_ = Invoke(ctx, callFunc, callOpts...)
+	}()
+
+	spans := exporter.GetSpans()
+	if len(spans) != 1 {
+		t.Fatalf("expected 1 span, got %d", len(spans))
+	}
+	span := spans[0]
+	// Should have recorded the panic error
+	if len(span.Events) == 0 {
+		t.Errorf("expected span to have an error event recorded")
+	}
+
+	if len(handler.records) != 1 {
+		t.Fatalf("expected 1 log record, got %d", len(handler.records))
+	}
+	record := handler.records[0]
+	
+	if record.Message != "panic: test panic" {
+		t.Errorf("expected panic log message, got %v", record.Message)
 	}
 }

@@ -32,6 +32,7 @@ package gax
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/url"
 	"strconv"
@@ -130,6 +131,10 @@ func invoke(ctx context.Context, call APICall, settings CallSettings, sp sleeper
 
 	if span != nil || logger != nil {
 		defer func() {
+			panicErr := recover()
+			if panicErr != nil {
+				err = fmt.Errorf("panic: %v", panicErr)
+			}
 			if span != nil {
 				if err != nil {
 					span.RecordError(err)
@@ -171,9 +176,14 @@ func invoke(ctx context.Context, call APICall, settings CallSettings, sp sleeper
 					attrs = append(attrs, attribute.String("url.template", urlSanitizer(urlTemplate)))
 				}
 
-				opts := make([]slog.Attr, 0, len(attrs))
+				opts := make([]slog.Attr, 0, len(attrs)+2)
 				for _, kv := range attrs {
 					opts = append(opts, otelAttrToSlogAttr(kv))
+				}
+				
+				if spanContext := trace.SpanContextFromContext(ctx); spanContext.IsValid() {
+					opts = append(opts, slog.String("trace_id", spanContext.TraceID().String()))
+					opts = append(opts, slog.String("span_id", spanContext.SpanID().String()))
 				}
 
 				if err != nil {
@@ -187,6 +197,9 @@ func invoke(ctx context.Context, call APICall, settings CallSettings, sp sleeper
 
 				// The prompt says: "Map errInfo correctly, translating OTel attributes back to slog.Attr via the otelAttrToSlogAttr translator (which you can use on the attrs slice)."
 				logger.LogAttrs(recordCtx, level, msg, opts...)
+			}
+			if panicErr != nil {
+				panic(panicErr)
 			}
 		}()
 	}
