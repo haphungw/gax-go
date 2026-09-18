@@ -566,6 +566,19 @@ func endSpan(ctx context.Context, span trace.Span, errInfo *TelemetryErrorInfo, 
 	}
 }
 
+// recordRetryEvent records a low-cardinality "Retry Attempt Failed" event on the client span.
+func recordRetryEvent(ctx context.Context, span trace.Span, retryCount int, err error) {
+	if span == nil {
+		return
+	}
+	errInfo := ExtractTelemetryErrorInfo(ctx, err)
+	span.AddEvent("Retry Attempt Failed", trace.WithAttributes(
+		attribute.Int("resend_count", retryCount),
+		attribute.String("error.type", errInfo.ErrorType),
+		attribute.String("rpc.response.status_code", errInfo.StatusCode),
+	))
+}
+
 // ClientTracing contains the pre-allocated OpenTelemetry tracer and attributes
 // for a specific generated Google Cloud client library.
 // There should be exactly one ClientTracing instance instantiated per generated client.

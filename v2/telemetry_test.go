@@ -1214,3 +1214,59 @@ func TestStartSpan(t *testing.T) {
 		}
 	})
 }
+
+func TestRecordRetryEvent(t *testing.T) {
+	t.Run("nil span", func(t *testing.T) {
+		recordRetryEvent(context.Background(), nil, 1, status.Error(codes.Unavailable, "unavailable"))
+	})
+
+	t.Run("valid span", func(t *testing.T) {
+		exporter := tracetest.NewInMemoryExporter()
+		tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exporter))
+		tracer := tp.Tracer("test")
+
+		ctx, span := tracer.Start(context.Background(), "test-span")
+		recordRetryEvent(ctx, span, 2, status.Error(codes.Unavailable, "secret error detail"))
+		span.End()
+
+		spans := exporter.GetSpans()
+		if len(spans) != 1 {
+			t.Fatalf("len(spans) = %d, want 1", len(spans))
+		}
+		s := spans[0]
+		if len(s.Events) != 1 {
+			t.Fatalf("len(events) = %d, want 1", len(s.Events))
+		}
+		event := s.Events[0]
+		if event.Name != "Retry Attempt Failed" {
+			t.Errorf("event.Name = %q, want 'Retry Attempt Failed'", event.Name)
+		}
+
+		gotAttrs := make(map[string]any)
+		for _, a := range event.Attributes {
+			switch a.Value.Type() {
+			case attribute.STRING:
+				gotAttrs[string(a.Key)] = a.Value.AsString()
+			case attribute.INT64:
+				gotAttrs[string(a.Key)] = int(a.Value.AsInt64())
+			}
+		}
+
+		wantAttrs := map[string]any{
+			"resend_count":             2,
+			"error.type":               "UNAVAILABLE",
+			"rpc.response.status_code": "UNAVAILABLE",
+		}
+		if diff := cmp.Diff(wantAttrs, gotAttrs); diff != "" {
+			t.Errorf("Event attributes mismatch (-want +got):\n%s", diff)
+		}
+
+		// Ensure raw error message is strictly excluded (PII-safety)
+		for _, a := range event.Attributes {
+			if a.Value.AsString() == "secret error detail" {
+				t.Errorf("raw error string found in event attribute %q", a.Key)
+			}
+		}
+	})
+}
+

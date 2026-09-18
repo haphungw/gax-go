@@ -80,6 +80,7 @@ type sleeper func(ctx context.Context, d time.Duration) error
 // invoke implements Invoke, taking an additional sleeper argument for testing.
 func invoke(ctx context.Context, call APICall, settings CallSettings, sp sleeper) (err error) {
 	var retryer Retryer
+	var span trace.Span
 
 	// Only use the value provided via WithTimeout if the context doesn't
 	// already have a deadline. This is important for backwards compatibility if
@@ -102,7 +103,6 @@ func invoke(ctx context.Context, call APICall, settings CallSettings, sp sleeper
 			ctx = InjectTransportTelemetry(ctx, &TransportTelemetryData{})
 		}
 
-		var span trace.Span
 		if tracingEnabled {
 			ctx, span = startSpan(ctx, settings.clientTracing)
 		}
@@ -150,9 +150,14 @@ func invoke(ctx context.Context, call APICall, settings CallSettings, sp sleeper
 				return err
 			}
 		}
-		if d, ok := retryer.Retry(err); !ok {
+		d, ok := retryer.Retry(err)
+		if !ok {
 			return err
-		} else if err = sp(ctx, d); err != nil {
+		}
+		if tracingEnabled {
+			recordRetryEvent(ctx, span, retryCount, err)
+		}
+		if err = sp(ctx, d); err != nil {
 			return err
 		}
 		retryCount++

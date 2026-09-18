@@ -37,6 +37,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/googleapis/gax-go/v2/callctx"
+	"go.opentelemetry.io/otel/attribute"
 	otelcodes "go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -259,6 +260,7 @@ func TestInvokeWithTracing(t *testing.T) {
 		wantStatus        otelcodes.Code
 		wantDataAttr      map[string]string
 		wantExcludedAttrs []string
+		wantEvents        []map[string]any
 		wantErr           bool
 	}{
 		{
@@ -324,7 +326,50 @@ func TestInvokeWithTracing(t *testing.T) {
 				"error.type":               "DEADLINE_EXCEEDED",
 				"rpc.response.status_code": "DEADLINE_EXCEEDED",
 			},
+			wantEvents: []map[string]any{
+				{
+					"name":                     "Retry Attempt Failed",
+					"resend_count":             0,
+					"error.type":               "DEADLINE_EXCEEDED",
+					"rpc.response.status_code": "DEADLINE_EXCEEDED",
+				},
+			},
 			wantErr: true,
+		},
+		{
+			name: "retry_with_backoff_then_success",
+			setupCtx: func() (context.Context, context.CancelFunc) {
+				return context.Background(), func() {}
+			},
+			callOpts: []CallOption{
+				WithRetry(func() Retryer { return &testRetryer{} }),
+			},
+			callFunc: func() func(context.Context, CallSettings) error {
+				attempts := 0
+				return func(ctx context.Context, settings CallSettings) error {
+					attempts++
+					if attempts == 1 {
+						return status.Error(codes.Unavailable, "temporarily unavailable")
+					}
+					return nil
+				}
+			}(),
+			wantName:   "gcp.client.request",
+			wantStatus: otelcodes.Ok,
+			wantDataAttr: map[string]string{
+				"url.domain":               "test.domain",
+				"rpc.system.name":          "grpc",
+				"rpc.response.status_code": "OK",
+			},
+			wantEvents: []map[string]any{
+				{
+					"name":                     "Retry Attempt Failed",
+					"resend_count":             0,
+					"error.type":               "UNAVAILABLE",
+					"rpc.response.status_code": "UNAVAILABLE",
+				},
+			},
+			wantErr: false,
 		},
 		{
 			name: "transport_telemetry_ignored",
@@ -407,6 +452,40 @@ func TestInvokeWithTracing(t *testing.T) {
 			for _, excl := range tt.wantExcludedAttrs {
 				if _, ok := gotAttrs[excl]; ok {
 					t.Errorf("attr %q should not be present on client span", excl)
+				}
+			}
+
+			var retryEvents []sdktrace.Event
+			for _, e := range span.Events {
+				if e.Name == "Retry Attempt Failed" {
+					retryEvents = append(retryEvents, e)
+				}
+			}
+
+			if len(retryEvents) != len(tt.wantEvents) {
+				t.Fatalf("len(retryEvents) = %d, want %d", len(retryEvents), len(tt.wantEvents))
+			}
+			for i, wantEvent := range tt.wantEvents {
+				gotEvent := retryEvents[i]
+				for k, wantVal := range wantEvent {
+					if k == "name" {
+						continue
+					}
+					var gotVal any
+					for _, a := range gotEvent.Attributes {
+						if string(a.Key) == k {
+							switch a.Value.Type() {
+							case attribute.STRING:
+								gotVal = a.Value.AsString()
+							case attribute.INT64:
+								gotVal = int(a.Value.AsInt64())
+							}
+							break
+						}
+					}
+					if gotVal != wantVal {
+						t.Errorf("retryEvent[%d].attr %q = %v, want %v", i, k, gotVal, wantVal)
+					}
 				}
 			}
 		})
